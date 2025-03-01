@@ -27,10 +27,10 @@ from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
 class LeatherbackEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 2
-    episode_length_s = 20.0
+    episode_length_s = 10.0
     action_scale = 20.0  # multiplying it with 10 since car need extra velocity, network output capped at -1.0 to 1.0
     action_space = 2
-    observation_space = 7
+    observation_space = 10
     state_space = 0
     debug_vis = True
 
@@ -102,10 +102,6 @@ class LeatherbackEnv(DirectRLEnv):
         # print('idx', self._all_dof_idx)
         # self.car.set_joint_velocity_target(self.actions, joint_ids=self._all_dof_idx)
         
-        # # Split the actions tensor for wheels and steering
-        # wheel_actions = self.actions[:, :2] * self.action_scale
-        # steering_actions = self.actions[:, 2:]
-        
         # Extract single values for wheels and steering
         wheel_action = self.actions[:, 0:1]  # Keep dimension for broadcasting
         steering_action = self.actions[:, 1:2]  # Keep dimension for broadcasting
@@ -114,12 +110,14 @@ class LeatherbackEnv(DirectRLEnv):
         wheel_actions = wheel_action.repeat(1, 2) * self.action_scale  # Duplicate for both wheels
         steering_actions = steering_action.repeat(1, 2)  # Duplicate for both steering joints
         
+        wheel_actions = torch.clamp(wheel_actions, -20.0, 20.0)
+        steering_actions = torch.clamp(steering_actions, -1.0, 1.0)
+        
         # print('wheel_actions', wheel_actions)
         # print('steering_actions', steering_actions)
 
         # Apply velocity control to wheels
-        self.car.set_joint_velocity_target(wheel_actions, joint_ids=self._wheel_dof_idx)
-        
+        self.car.set_joint_velocity_target(wheel_actions, joint_ids=self._wheel_dof_idx)        
         # Apply position control to steering
         self.car.set_joint_position_target(steering_actions, joint_ids=self._steering_dof_idx)
 
@@ -127,11 +125,17 @@ class LeatherbackEnv(DirectRLEnv):
         # testing_steer = torch.zeros_like(steering_actions)
         # self.car.set_joint_velocity_target(testing_wheel, joint_ids=self._wheel_dof_idx)
         # self.car.set_joint_position_target(testing_steer, joint_ids=self._steering_dof_idx)
+        
+        wandb.log({
+            "action_vel": wheel_action.mean().item(),
+            "action_steer": steering_action.mean().item(),
+        })
 
 
     def _get_observations(self) -> dict:
         # print('obs', self.car.data.root_lin_vel_b.shape)
-        distance_to_goal = torch.linalg.norm(self.goal_pos_w - self.car.data.root_pos_w, dim=1)
+        distance_vector = torch.subtract(self.goal_pos_w, self.car.data.root_pos_w)
+        distance_to_goal = torch.linalg.norm(distance_vector, dim=1)
         distance_to_goal = distance_to_goal.unsqueeze(-1)
         
         # print(distance_to_goal.shape)
@@ -142,6 +146,7 @@ class LeatherbackEnv(DirectRLEnv):
             (
                 self.car.data.root_lin_vel_b,
                 self.car.data.root_ang_vel_b,
+                distance_vector,
                 distance_to_goal,
             ),
             dim=-1,
@@ -150,22 +155,23 @@ class LeatherbackEnv(DirectRLEnv):
         return observations
 
     def _get_rewards(self) -> torch.Tensor:
-        rew_alive = 1.0 * (1.0 - self.reset_terminated.float())
-        rew_termination = -2.0 * self.reset_terminated.float()
+        # rew_alive = 1.0 * (1.0 - self.reset_terminated.float())
+        # rew_termination = -2.0 * self.reset_terminated.float()
         
         distance_to_goal = torch.linalg.norm(self.goal_pos_w - self.car.data.root_pos_w, dim=1)
         
         dist_reward = torch.where((self.prev_min_dist_goal - distance_to_goal) > 0.0, 1.0, 0.0 )
-        dist_reward = 0.5/distance_to_goal + dist_reward # to encourage the robot to move towards goal but also prefer moving towards goal continously
+        dist_reward = 1.0/distance_to_goal + dist_reward # to encourage the robot to move towards goal but also prefer moving towards goal continously
         
         acc_penalty = torch.where(torch.any(torch.abs(self.car.data.root_lin_vel_w [:, :2]) > 0.8), -1.0, 0.0)
         
-        total_reward = rew_alive + rew_termination + dist_reward + acc_penalty
+        # total_reward = rew_alive + rew_termination + dist_reward + acc_penalty
+        total_reward = dist_reward + acc_penalty
         
         # Log metrics to wandb
         wandb.log({
             "total_reward": total_reward.mean().item(),
-            "alive_reward": rew_alive.mean().item(),
+            # "alive_reward": rew_alive.mean().item(),
             "distance_reward": dist_reward.mean().item(),
             "acc_penalty": acc_penalty.mean().item(),
         })
