@@ -19,6 +19,7 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import sample_uniform
+from isaaclab.sensors import Camera, CameraCfg
 
 from isaaclab_tasks.custom.leatherback.isaaclab_assets.leatherback import LEATHERBACK_CFG
 from isaaclab.markers import CUBOID_MARKER_CFG  # isort: skip
@@ -30,7 +31,7 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     episode_length_s = 10.0
     action_scale = 20.0  # multiplying it with 10 since car need extra velocity, network output capped at -1.0 to 1.0
     action_space = 2
-    observation_space = 10
+    observation_space = {"robot_val": 10, "depth": [480, 640, 1]} #10
     state_space = 0
     debug_vis = True
 
@@ -41,9 +42,22 @@ class LeatherbackEnvCfg(DirectRLEnvCfg):
     robot_cfg: ArticulationCfg = LEATHERBACK_CFG.replace(prim_path="/World/envs/env_.*/Robot")
     wheels_dof_name = ["Wheel__Upright__Rear_Right", "Wheel__Upright__Rear_Left"]
     steering_dof_name = ["Knuckle__Upright__Front_Right", "Knuckle__Upright__Front_Left"]
+    
+    # sensors
+    camera_cfg = CameraCfg(
+        prim_path="/World/envs/env_.*/Robot/front_cam",
+        update_period=0.1,
+        height=480,
+        width=640,
+        data_types=["rgb", "distance_to_image_plane"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0, focus_distance=400.0, horizontal_aperture=20.955, clipping_range=(0.1, 1.0e5)
+        ),
+        offset=CameraCfg.OffsetCfg(pos=(12.0, 0.0, 19.0), rot=(0.5, -0.5, 0.5, -0.5), convention="ros"),
+    )
 
     # scene
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=True)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4, env_spacing=4.0, replicate_physics=True)
 
 
 class LeatherbackEnv(DirectRLEnv):
@@ -72,7 +86,7 @@ class LeatherbackEnv(DirectRLEnv):
         
         # Initialize wandb
         wandb.init(
-            project="leatherback-training",
+            project="leatherback-camera",
             config={
                 "num_envs": self.num_envs,
                 "episode_length": self.cfg.episode_length_s,
@@ -82,12 +96,14 @@ class LeatherbackEnv(DirectRLEnv):
 
     def _setup_scene(self):
         self.car = Articulation(self.cfg.robot_cfg)
+        self.camera = Camera(self.cfg.camera_cfg)
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         # add articulation to scene
         self.scene.articulations["car"] = self.car
+        self.scene.sensors["camera"] = self.camera
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -116,6 +132,7 @@ class LeatherbackEnv(DirectRLEnv):
         self.car.set_joint_position_target(steering_actions, joint_ids=self._steering_dof_idx)
 
         # testing_wheel = torch.ones_like(wheel_actions) * 10
+        # testing_wheel = torch.zeros_like(wheel_actions) * 10
         # testing_steer = torch.zeros_like(steering_actions)
         # self.car.set_joint_velocity_target(testing_wheel, joint_ids=self._wheel_dof_idx)
         # self.car.set_joint_position_target(testing_steer, joint_ids=self._steering_dof_idx)
@@ -136,7 +153,13 @@ class LeatherbackEnv(DirectRLEnv):
         # print(self.car.data.root_lin_vel_b.shape)
         # print(self.car.data.root_ang_vel_b.shape)
         
-        obs = torch.cat(
+        rgb_img = self.scene["camera"].data.output["rgb"]
+        depth_img = self.scene["camera"].data.output["distance_to_image_plane"]
+        
+        # print("rgb image shape is ", rgb_img.shape)
+        # print("depth image shape is ", depth_img.shape)
+        
+        robot_val = torch.cat(
             (
                 self.car.data.root_lin_vel_b,
                 self.car.data.root_ang_vel_b,
@@ -145,7 +168,14 @@ class LeatherbackEnv(DirectRLEnv):
             ),
             dim=-1,
         )
+        
+        obs = {
+            "robot_val": robot_val,
+            "depth": depth_img,
+        }
+        
         observations = {"policy": obs}
+        
         return observations
 
     def _get_rewards(self) -> torch.Tensor:

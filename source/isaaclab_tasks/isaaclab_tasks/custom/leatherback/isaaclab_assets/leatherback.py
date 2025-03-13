@@ -57,4 +57,4 @@ LEATHERBACK_CFG = ArticulationCfg(
         ),
     },
 )
-"""Configuration for a simple Cartpole robot."""
+"""Configuration for a simple Car robot."""
